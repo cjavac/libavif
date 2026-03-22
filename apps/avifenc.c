@@ -9,6 +9,7 @@
 #include "y4m.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
@@ -19,6 +20,12 @@
 // for setmode()
 #include <fcntl.h>
 #include <io.h>
+#include <direct.h>
+#include <windows.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #endif
 
 #define NEXTARG()                                                     \
@@ -189,6 +196,7 @@ typedef struct avifEncodedByteSizes
 static void syntaxShort(void)
 {
     printf("Syntax: avifenc [options] -q quality input.[jpg|jpeg|png|y4m] output.avif\n");
+    printf("        avifenc [options] input_directory output_directory\n");
     printf("where quality is between %d (worst quality) and %d (lossless).\n", AVIF_QUALITY_WORST, AVIF_QUALITY_LOSSLESS);
     printf("Typical value is 60-80.\n\n");
     printf("Try -h for an exhaustive list of options.\n");
@@ -197,9 +205,16 @@ static void syntaxShort(void)
 static void syntaxLong(void)
 {
     printf("Syntax: avifenc [options] input.[jpg|jpeg|png|y4m] output.avif\n");
+    printf("        avifenc [options] input_directory output_directory\n");
     printf("Standard options:\n");
     printf("    -h,--help                         : Show syntax help (this page)\n");
     printf("    -V,--version                      : Show the version number\n");
+    printf("\n");
+    printf("Directory mode:\n");
+    printf("    If both input and output are directories, avifenc recursively scans the input directory,\n");
+    printf("    encodes supported files (jpeg/png/y4m), skips unsupported files, keeps relative subdirectories,\n");
+    printf("    and writes output files with the same basename and the .avif extension.\n");
+    printf("    Directory mode does not support --layered or --grid.\n");
     printf("\n");
     printf("Basic options:\n");
     printf("    -q,--qcolor Q                     : Quality for color in %d..%d where %d is lossless\n",
@@ -216,8 +231,8 @@ static void syntaxLong(void)
     printf("\n");
     printf("Advanced options:\n");
     printf("    -j,--jobs J                       : Number of jobs (worker threads), or 'all' to potentially use as many cores as possible. (Default: all)\n");
-    printf("    --no-overwrite                    : Never overwrite existing output file\n");
-    printf("    -o,--output FILENAME              : Instead of using the last filename given as output, use this filename\n");
+    printf("    --no-overwrite                    : Never overwrite existing output file(s)\n");
+    printf("    -o,--output FILENAME              : Instead of using the last filename given as output, use this filename or directory\n");
 #if defined(AVIF_ENABLE_EXPERIMENTAL_MINI)
     printf("    --mini                            : EXPERIMENTAL: Use reduced header if possible (backward-incompatible)\n");
 #endif
@@ -1364,6 +1379,292 @@ static void avifInputAdd(avifInput * input, const char * filePath, uint64_t dura
     ++input->filesCount;
 }
 
+static avifBool avifIsPathSeparator(char c)
+{
+    return (c == '\\') || (c == '/');
+}
+
+static const char * avifLastPathSeparator(const char * path)
+{
+    const char * lastForward = strrchr(path, '/');
+    const char * lastBackward = strrchr(path, '\\');
+    if (lastForward == NULL) {
+        return lastBackward;
+    }
+    if (lastBackward == NULL) {
+        return lastForward;
+    }
+    return (lastForward > lastBackward) ? lastForward : lastBackward;
+}
+
+static char * avifStringDuplicate(const char * src)
+{
+    const size_t len = strlen(src);
+    char * dst = malloc(len + 1);
+    if (dst == NULL) {
+        return NULL;
+    }
+    memcpy(dst, src, len + 1);
+    return dst;
+}
+
+static char * avifPathJoin(const char * left, const char * right)
+{
+    if ((left == NULL || left[0] == '\0') && (right == NULL || right[0] == '\0')) {
+        return avifStringDuplicate("");
+    }
+    if (left == NULL || left[0] == '\0') {
+        return avifStringDuplicate(right);
+    }
+    if (right == NULL || right[0] == '\0') {
+        return avifStringDuplicate(left);
+    }
+
+    while (avifIsPathSeparator(*right)) {
+        ++right;
+    }
+
+    const size_t leftLen = strlen(left);
+    const size_t rightLen = strlen(right);
+    const avifBool needSeparator = !avifIsPathSeparator(left[leftLen - 1]);
+    const size_t outLen = leftLen + (needSeparator ? 1 : 0) + rightLen;
+
+    char * out = malloc(outLen + 1);
+    if (out == NULL) {
+        return NULL;
+    }
+    memcpy(out, left, leftLen);
+    size_t offset = leftLen;
+    if (needSeparator) {
+#if defined(_WIN32)
+        out[offset++] = '\\';
+#else
+        out[offset++] = '/';
+#endif
+    }
+    if (rightLen > 0) {
+        memcpy(out + offset, right, rightLen);
+        offset += rightLen;
+    }
+    out[offset] = '\0';
+    return out;
+}
+
+static char * avifReplaceExtensionWithAvif(const char * path)
+{
+    const char * lastSeparator = avifLastPathSeparator(path);
+    const char * lastDot = strrchr(path, '.');
+    size_t basenameLen = strlen(path);
+    if ((lastDot != NULL) && ((lastSeparator == NULL) || (lastDot > lastSeparator))) {
+        basenameLen = (size_t)(lastDot - path);
+    }
+
+    char * out = malloc(basenameLen + strlen(".avif") + 1);
+    if (out == NULL) {
+        return NULL;
+    }
+    memcpy(out, path, basenameLen);
+    memcpy(out + basenameLen, ".avif", strlen(".avif") + 1);
+    return out;
+}
+
+static avifBool avifPathIsDirectory(const char * path)
+{
+#if defined(_WIN32)
+    const DWORD attributes = GetFileAttributesA(path);
+    return (attributes != INVALID_FILE_ATTRIBUTES) && ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+#else
+    struct stat info;
+    return (stat(path, &info) == 0) && S_ISDIR(info.st_mode);
+#endif
+}
+
+static avifBool avifPathIsRegularFile(const char * path)
+{
+#if defined(_WIN32)
+    const DWORD attributes = GetFileAttributesA(path);
+    return (attributes != INVALID_FILE_ATTRIBUTES) && ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0);
+#else
+    struct stat info;
+    return (stat(path, &info) == 0) && S_ISREG(info.st_mode);
+#endif
+}
+
+static avifBool avifCreateDirectory(const char * path)
+{
+    if ((path == NULL) || (path[0] == '\0')) {
+        return AVIF_TRUE;
+    }
+#if defined(_WIN32)
+    if (_mkdir(path) == 0) {
+        return AVIF_TRUE;
+    }
+#else
+    if (mkdir(path, 0777) == 0) {
+        return AVIF_TRUE;
+    }
+#endif
+    if (errno == EEXIST) {
+        return avifPathIsDirectory(path);
+    }
+    return AVIF_FALSE;
+}
+
+static avifBool avifEnsureDirectoryExists(const char * directoryPath)
+{
+    if ((directoryPath == NULL) || (directoryPath[0] == '\0')) {
+        return AVIF_TRUE;
+    }
+
+    char * path = avifStringDuplicate(directoryPath);
+    if (path == NULL) {
+        fprintf(stderr, "ERROR: Out of memory while creating directory path.\n");
+        return AVIF_FALSE;
+    }
+
+    size_t len = strlen(path);
+    while ((len > 0) && avifIsPathSeparator(path[len - 1])) {
+#if defined(_WIN32)
+        if ((len == 3) && (path[1] == ':')) {
+            break;
+        }
+#endif
+        if (len == 1) {
+            break;
+        }
+        path[len - 1] = '\0';
+        --len;
+    }
+
+    if (len == 0) {
+        free(path);
+        return AVIF_TRUE;
+    }
+
+    size_t start = 0;
+#if defined(_WIN32)
+    if ((len >= 2) && (path[1] == ':')) {
+        start = 2;
+        if ((len > 2) && avifIsPathSeparator(path[2])) {
+            start = 3;
+        }
+    } else if ((len >= 2) && avifIsPathSeparator(path[0]) && avifIsPathSeparator(path[1])) {
+        // UNC path: skip "\\server\share\" prefix.
+        start = 2;
+        int separatorsSeen = 0;
+        while ((start < len) && (separatorsSeen < 2)) {
+            if (avifIsPathSeparator(path[start])) {
+                ++separatorsSeen;
+            }
+            ++start;
+        }
+    } else if (avifIsPathSeparator(path[0])) {
+        start = 1;
+    }
+#else
+    if (avifIsPathSeparator(path[0])) {
+        start = 1;
+    }
+#endif
+
+    for (size_t i = start; i <= len; ++i) {
+        if ((i != len) && !avifIsPathSeparator(path[i])) {
+            continue;
+        }
+
+        const char saved = path[i];
+        path[i] = '\0';
+        if ((path[0] != '\0') && !avifCreateDirectory(path)) {
+            fprintf(stderr, "ERROR: Failed to create directory: %s\n", path);
+            free(path);
+            return AVIF_FALSE;
+        }
+        path[i] = saved;
+    }
+
+    free(path);
+    return AVIF_TRUE;
+}
+
+static avifBool avifEnsureParentDirectory(const char * filename)
+{
+    const char * lastSeparator = avifLastPathSeparator(filename);
+    if (lastSeparator == NULL) {
+        return AVIF_TRUE;
+    }
+
+    const size_t parentLen = (size_t)(lastSeparator - filename);
+    if (parentLen == 0) {
+        return AVIF_TRUE;
+    }
+
+    char * parentDir = malloc(parentLen + 1);
+    if (parentDir == NULL) {
+        fprintf(stderr, "ERROR: Out of memory while creating parent directory path.\n");
+        return AVIF_FALSE;
+    }
+    memcpy(parentDir, filename, parentLen);
+    parentDir[parentLen] = '\0';
+
+    const avifBool ok = avifEnsureDirectoryExists(parentDir);
+    free(parentDir);
+    return ok;
+}
+
+static avifBool avifIsSupportedBatchInputFormat(avifAppFileFormat format)
+{
+    return (format == AVIF_APP_FILE_FORMAT_JPEG) || (format == AVIF_APP_FILE_FORMAT_PNG) || (format == AVIF_APP_FILE_FORMAT_Y4M);
+}
+
+static void avifInputCleanup(avifInput * input)
+{
+    while (input->cacheCount) {
+        --input->cacheCount;
+        if (input->cache[input->cacheCount].image) {
+            avifImageDestroy(input->cache[input->cacheCount].image);
+        }
+    }
+    free(input->cache);
+    input->cache = NULL;
+
+    while (input->filesCount) {
+        --input->filesCount;
+        avifInputFile * file = &input->files[input->filesCount];
+        avifCodecSpecificOptionsFree(&file->settings.codecSpecificOptions);
+    }
+    free(input->files);
+    input->files = NULL;
+}
+
+static avifBool avifInputInitSingleFile(avifInput * input,
+                                        const char * filename,
+                                        uint64_t duration,
+                                        const avifInputFileSettings * settingsTemplate,
+                                        avifPixelFormat requestedFormat,
+                                        int requestedDepth,
+                                        int requestedDepthExtension)
+{
+    memset(input, 0, sizeof(*input));
+    input->files = malloc(sizeof(avifInputFile));
+    if (input->files == NULL) {
+        fprintf(stderr, "ERROR: memory allocation failure\n");
+        return AVIF_FALSE;
+    }
+    input->filesCount = 1;
+    input->fileIndex = 0;
+    input->requestedFormat = requestedFormat;
+    input->requestedDepth = requestedDepth;
+    input->requestedDepthExtension = requestedDepthExtension;
+    input->files[0].filename = filename;
+    input->files[0].duration = duration;
+    memset(&input->files[0].settings, 0, sizeof(input->files[0].settings));
+    if (!avifInputFileSettingsOverwrite(&input->files[0].settings, settingsTemplate)) {
+        avifInputCleanup(input);
+        return AVIF_FALSE;
+    }
+    return AVIF_TRUE;
+}
+
 static int quantizerToQuality(int minQuantizer, int maxQuantizer)
 {
     // When calculating the average quantizer, discard the fractional part for a
@@ -1371,6 +1672,773 @@ static int quantizerToQuality(int minQuantizer, int maxQuantizer)
     const int quantizer = (minQuantizer + maxQuantizer) / 2;
     const int quality = ((63 - quantizer) * 100 + 31) / 63;
     return quality;
+}
+
+static avifBool avifEncodeSingleInputToFile(avifSettings settings,
+                                            avifInput * input,
+                                            const char * outputFilename,
+                                            avifBool noOverwrite,
+                                            avifRange requestedRange,
+                                            avifBool lossless,
+                                            avifBool premultiplyAlpha,
+                                            avifBool cropConversionRequired,
+                                            uint8_t irotAngle,
+                                            uint8_t imirAxis,
+                                            const avifRWData * exifOverride,
+                                            const avifRWData * xmpOverride,
+                                            const avifRWData * iccOverride)
+{
+    if (input->filesCount != 1) {
+        fprintf(stderr, "ERROR: Batch mode expected exactly one input file per encode task.\n");
+        return AVIF_FALSE;
+    }
+    if (settings.layered || settings.gridDimsPresent) {
+        fprintf(stderr, "ERROR: Batch mode does not support --layered or --grid.\n");
+        return AVIF_FALSE;
+    }
+
+    // In batch mode each file is encoded independently.
+    if (settings.progressive) {
+        settings.layers = 2;
+    } else {
+        settings.layers = 1;
+    }
+
+    avifInputFile * file = &input->files[0];
+    avifInputFileSettings * fileSettings = &file->settings;
+    if (!fileSettings->qualityAlpha.set) {
+        fileSettings->qualityAlpha = fileSettings->quality;
+    }
+
+    if (settings.jobs == -1) {
+        settings.jobs = avifQueryCPUCount();
+    }
+
+    // Check global lossless parameters and set to default if needed.
+    if (lossless) {
+        // Pixel format.
+        if (input->requestedFormat != AVIF_PIXEL_FORMAT_NONE && input->requestedFormat != AVIF_PIXEL_FORMAT_YUV444 &&
+            input->requestedFormat != AVIF_PIXEL_FORMAT_YUV400) {
+            fprintf(stderr,
+                    "When set, the pixel format can only be 444 in lossless "
+                    "mode. 400 also works if the input is grayscale.\n");
+            return AVIF_FALSE;
+        }
+        // Codec.
+        const char * codecName = avifCodecName(settings.codecChoice, AVIF_CODEC_FLAG_CAN_ENCODE);
+        if (codecName && !strcmp(codecName, "rav1e")) {
+            fprintf(stderr, "rav1e doesn't support lossless encoding yet: https://github.com/xiph/rav1e/issues/151\n");
+            return AVIF_FALSE;
+        } else if (codecName && !strcmp(codecName, "svt")) {
+            char versions[256];
+            avifCodecVersions(versions);
+            const char svtVersionPrefix[] = "svt [enc]:v";
+            const char * svtVersionPrefixPos = strstr(versions, svtVersionPrefix);
+            if (svtVersionPrefixPos != NULL) {
+                const char * svtVersion = svtVersionPrefixPos + strlen(svtVersionPrefix);
+                const int svtMajorVersion = atoi(svtVersion);
+                if (svtMajorVersion < 3) {
+                    fprintf(stderr, "SVT-AV1 lossless support was added in version 3.0.0, current major version is only %d\n", svtMajorVersion);
+                    return AVIF_FALSE;
+                }
+            }
+        }
+        // Range.
+        if (requestedRange != AVIF_RANGE_FULL) {
+            fprintf(stderr, "Range has to be full in lossless mode.\n");
+            return AVIF_FALSE;
+        }
+        // Matrix coefficients.
+        if (settings.cicpExplicitlySet) {
+            if (settings.matrixCoefficients != AVIF_MATRIX_COEFFICIENTS_IDENTITY &&
+                settings.matrixCoefficients != AVIF_MATRIX_COEFFICIENTS_YCGCO_RE &&
+                settings.matrixCoefficients != AVIF_MATRIX_COEFFICIENTS_YCGCO_RO) {
+                fprintf(stderr, "Matrix coefficients have to be identity, YCgCo-Re, or YCgCo-Ro in lossless mode.\n");
+                return AVIF_FALSE;
+            }
+        } else {
+            settings.matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_IDENTITY;
+        }
+        if (settings.progressive) {
+            fprintf(stderr, "Automatic layered encoding is unsupported in lossless mode.\n");
+        }
+    }
+
+    // Check tiling parameters.
+    if (fileSettings->autoTiling.set) {
+        if (fileSettings->tileRowsLog2.set || fileSettings->tileColsLog2.set) {
+            fprintf(stderr, "ERROR: --autotiling is specified but --tilerowslog2 or --tilecolslog2 is also specified.\n");
+            return AVIF_FALSE;
+        }
+        assert(fileSettings->autoTiling.value);
+        fileSettings->tileRowsLog2 = intSettingsEntryOf(0);
+        fileSettings->tileColsLog2 = intSettingsEntryOf(0);
+    } else if (fileSettings->tileColsLog2.set || fileSettings->tileRowsLog2.set) {
+        fileSettings->autoTiling = boolSettingsEntryOf(AVIF_FALSE);
+    }
+
+    // Check per-input lossy/lossless parameters.
+    if (lossless) {
+        if ((fileSettings->quality.set && fileSettings->quality.value != AVIF_QUALITY_LOSSLESS) ||
+            (fileSettings->qualityAlpha.set && fileSettings->qualityAlpha.value != AVIF_QUALITY_LOSSLESS)) {
+            fprintf(stderr, "ERROR: Quality cannot be set in lossless mode, except to %d.\n", AVIF_QUALITY_LOSSLESS);
+            return AVIF_FALSE;
+        }
+        if ((fileSettings->minQuantizer.set && fileSettings->minQuantizer.value != AVIF_QUANTIZER_LOSSLESS) ||
+            (fileSettings->maxQuantizer.set && fileSettings->maxQuantizer.value != AVIF_QUANTIZER_LOSSLESS) ||
+            (fileSettings->minQuantizerAlpha.set && fileSettings->minQuantizerAlpha.value != AVIF_QUANTIZER_LOSSLESS) ||
+            (fileSettings->maxQuantizerAlpha.set && fileSettings->maxQuantizerAlpha.value != AVIF_QUANTIZER_LOSSLESS)) {
+            fprintf(stderr, "ERROR: Quantizers cannot be set in lossless mode, except to %d.\n", AVIF_QUANTIZER_LOSSLESS);
+            return AVIF_FALSE;
+        }
+    } else if (settings.progressive) {
+        assert(DEFAULT_QUALITY >= PROGRESSIVE_WORST_QUALITY);
+        if (fileSettings->quality.set && fileSettings->quality.value < PROGRESSIVE_WORST_QUALITY) {
+            fprintf(stderr, "ERROR: --qcolor must be at least %d when using --progressive.\n", PROGRESSIVE_WORST_QUALITY);
+            return AVIF_FALSE;
+        }
+    }
+
+    if (fileSettings->minQuantizer.set != fileSettings->maxQuantizer.set) {
+        fprintf(stderr, "ERROR: --min and --max must be either both specified or both unspecified for input %s.\n", avifPrettyFilename(file->filename));
+        return AVIF_FALSE;
+    }
+    if (fileSettings->minQuantizerAlpha.set != fileSettings->maxQuantizerAlpha.set) {
+        fprintf(stderr,
+                "ERROR: --minalpha and --maxalpha must be either both specified or both unspecified for input %s.\n",
+                avifPrettyFilename(file->filename));
+        return AVIF_FALSE;
+    }
+    if (fileSettings->minQuantizer.set && fileSettings->maxQuantizer.set) {
+        fprintf(stderr,
+                "WARNING: --min and --max are deprecated, please use -q 0..100 instead. "
+                "--min %d --max %d is equivalent to -q %d\n",
+                fileSettings->minQuantizer.value,
+                fileSettings->maxQuantizer.value,
+                quantizerToQuality(fileSettings->minQuantizer.value, fileSettings->maxQuantizer.value));
+    }
+    if (fileSettings->minQuantizerAlpha.set && fileSettings->maxQuantizerAlpha.set) {
+        fprintf(stderr,
+                "WARNING: --minalpha and --maxalpha are deprecated, please use --qalpha 0..100 instead. "
+                "--minalpha %d --maxalpha %d is equivalent to --qalpha %d\n",
+                fileSettings->minQuantizerAlpha.value,
+                fileSettings->maxQuantizerAlpha.value,
+                quantizerToQuality(fileSettings->minQuantizerAlpha.value, fileSettings->maxQuantizerAlpha.value));
+    }
+
+    if (!fileSettings->autoTiling.set) {
+        fileSettings->autoTiling = boolSettingsEntryOf(AVIF_TRUE);
+    }
+    if (!fileSettings->tileRowsLog2.set) {
+        fileSettings->tileRowsLog2 = intSettingsEntryOf(0);
+    }
+    if (!fileSettings->tileColsLog2.set) {
+        fileSettings->tileColsLog2 = intSettingsEntryOf(0);
+    }
+
+    if (lossless) {
+        fileSettings->quality = intSettingsEntryOf(AVIF_QUALITY_LOSSLESS);
+        fileSettings->qualityAlpha = intSettingsEntryOf(AVIF_QUALITY_LOSSLESS);
+        fileSettings->minQuantizer = intSettingsEntryOf(AVIF_QUANTIZER_LOSSLESS);
+        fileSettings->maxQuantizer = intSettingsEntryOf(AVIF_QUANTIZER_LOSSLESS);
+        fileSettings->minQuantizerAlpha = intSettingsEntryOf(AVIF_QUANTIZER_LOSSLESS);
+        fileSettings->maxQuantizerAlpha = intSettingsEntryOf(AVIF_QUANTIZER_LOSSLESS);
+    } else {
+        settings.qualityIsConstrained = fileSettings->quality.set;
+        settings.qualityAlphaIsConstrained = fileSettings->qualityAlpha.set;
+
+        if (fileSettings->minQuantizer.set) {
+            assert(fileSettings->maxQuantizer.set);
+            if (!fileSettings->quality.set) {
+                const int quality = quantizerToQuality(fileSettings->minQuantizer.value, fileSettings->maxQuantizer.value);
+                fileSettings->quality = intSettingsEntryOf(quality);
+            }
+        } else {
+            assert(!fileSettings->maxQuantizer.set);
+            if (!fileSettings->quality.set) {
+                fileSettings->quality = intSettingsEntryOf(DEFAULT_QUALITY);
+            }
+            fileSettings->minQuantizer = intSettingsEntryOf(AVIF_QUANTIZER_BEST_QUALITY);
+            fileSettings->maxQuantizer = intSettingsEntryOf(AVIF_QUANTIZER_WORST_QUALITY);
+        }
+
+        if (fileSettings->minQuantizerAlpha.set) {
+            assert(fileSettings->maxQuantizerAlpha.set);
+            if (!fileSettings->qualityAlpha.set) {
+                const int qualityAlpha =
+                    quantizerToQuality(fileSettings->minQuantizerAlpha.value, fileSettings->maxQuantizerAlpha.value);
+                fileSettings->qualityAlpha = intSettingsEntryOf(qualityAlpha);
+            }
+        } else {
+            assert(!fileSettings->maxQuantizerAlpha.set);
+            if (!fileSettings->qualityAlpha.set) {
+                fileSettings->qualityAlpha = fileSettings->quality;
+            }
+            fileSettings->minQuantizerAlpha = intSettingsEntryOf(AVIF_QUANTIZER_BEST_QUALITY);
+            fileSettings->maxQuantizerAlpha = intSettingsEntryOf(AVIF_QUANTIZER_WORST_QUALITY);
+        }
+    }
+
+    if (!fileSettings->scalingMode.set) {
+        fileSettings->scalingMode = scalingModeSettingsEntryOf(1, 1);
+    }
+
+    avifImage * image = avifImageCreateEmpty();
+    if (!image) {
+        fprintf(stderr, "ERROR: Out of memory\n");
+        return AVIF_FALSE;
+    }
+
+    avifRWData raw = AVIF_DATA_EMPTY;
+    avifBool success = AVIF_FALSE;
+
+    // Set these in advance so any upcoming RGB -> YUV use the proper coefficients.
+    image->colorPrimaries = settings.colorPrimaries;
+    image->transferCharacteristics = settings.transferCharacteristics;
+    image->matrixCoefficients = settings.matrixCoefficients;
+    image->yuvRange = requestedRange;
+    image->alphaPremultiplied = premultiplyAlpha;
+
+    if ((image->matrixCoefficients == AVIF_MATRIX_COEFFICIENTS_IDENTITY) && (input->requestedFormat != AVIF_PIXEL_FORMAT_NONE) &&
+        (input->requestedFormat != AVIF_PIXEL_FORMAT_YUV444)) {
+        image->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_BT601;
+        if (settings.cicpExplicitlySet) {
+            printf("WARNING: matrixCoefficients may not be set to identity (0) when %s. Resetting MC to defaults (%d).\n",
+                   (input->requestedFormat == AVIF_PIXEL_FORMAT_YUV400) ? "encoding 4:0:0" : "subsampling",
+                   image->matrixCoefficients);
+        }
+    }
+
+    input->cacheEnabled = (settings.targetSize != -1);
+
+    const avifInputFile * firstFile = avifInputGetFile(input, /*imageIndex=*/0);
+    uint32_t sourceDepth = 0;
+    avifBool sourceWasRGB = AVIF_FALSE;
+    avifAppSourceTiming firstSourceTiming;
+    const avifBool ignoreGainMap = settings.ignoreGainMap || settings.progressive;
+    if (!avifInputReadImage(input,
+                            /*imageIndex=*/0,
+                            settings.ignoreColorProfile,
+                            settings.ignoreExif,
+                            settings.ignoreXMP,
+                            /*allowChangingCicp=*/!settings.cicpExplicitlySet,
+                            ignoreGainMap,
+                            image,
+                            /*settings=*/NULL,
+                            &sourceDepth,
+                            &sourceWasRGB,
+                            &firstSourceTiming,
+                            settings.chromaDownsampling,
+                            settings.inputFormat)) {
+        goto cleanup;
+    }
+
+    if ((image->matrixCoefficients == AVIF_MATRIX_COEFFICIENTS_IDENTITY) && (image->yuvFormat == AVIF_PIXEL_FORMAT_YUV400)) {
+        image->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_BT601;
+        if (settings.cicpExplicitlySet) {
+            printf("WARNING: matrixCoefficients may not be set to identity (0) when encoding 4:0:0. Resetting MC to defaults (%d).\n",
+                   image->matrixCoefficients);
+        }
+    }
+    if ((image->matrixCoefficients == AVIF_MATRIX_COEFFICIENTS_IDENTITY) && (image->yuvFormat != AVIF_PIXEL_FORMAT_YUV444)) {
+        fprintf(stderr, "matrixCoefficients may not be set to identity (0) when subsampling.\n");
+        goto cleanup;
+    }
+
+    printf("Successfully loaded: %s\n", avifPrettyFilename(firstFile->filename));
+
+    // Prepare image timings.
+    if ((settings.outputTiming.duration == 0) && (settings.outputTiming.timescale == 0) && (firstSourceTiming.duration > 0) &&
+        (firstSourceTiming.timescale > 0)) {
+        settings.outputTiming = firstSourceTiming;
+    } else {
+        if (settings.outputTiming.duration == 0) {
+            settings.outputTiming.duration = 1;
+        }
+        if (settings.outputTiming.timescale == 0) {
+            settings.outputTiming.timescale = 30;
+        }
+    }
+
+    if ((iccOverride->size && (avifImageSetProfileICC(image, iccOverride->data, iccOverride->size) != AVIF_RESULT_OK)) ||
+        (exifOverride->size && (avifImageSetMetadataExif(image, exifOverride->data, exifOverride->size) != AVIF_RESULT_OK)) ||
+        (xmpOverride->size && (avifImageSetMetadataXMP(image, xmpOverride->data, xmpOverride->size) != AVIF_RESULT_OK))) {
+        fprintf(stderr, "Error when setting overridden metadata: out of memory.\n");
+        goto cleanup;
+    }
+
+    if (!image->icc.size && !settings.cicpExplicitlySet && (image->colorPrimaries == AVIF_COLOR_PRIMARIES_UNSPECIFIED) &&
+        (image->transferCharacteristics == AVIF_TRANSFER_CHARACTERISTICS_UNSPECIFIED)) {
+        image->colorPrimaries = AVIF_COLOR_PRIMARIES_SRGB;
+        image->transferCharacteristics = AVIF_TRANSFER_CHARACTERISTICS_SRGB;
+    }
+
+#if defined(AVIF_ENABLE_JPEG_GAIN_MAP_CONVERSION)
+    if (image->gainMap && !image->gainMap->altICC.size) {
+        if (image->gainMap->altColorPrimaries == AVIF_COLOR_PRIMARIES_UNSPECIFIED) {
+            image->gainMap->altColorPrimaries = image->colorPrimaries;
+        }
+        if (image->gainMap->altTransferCharacteristics == AVIF_TRANSFER_CHARACTERISTICS_UNSPECIFIED) {
+            image->gainMap->altTransferCharacteristics = AVIF_TRANSFER_CHARACTERISTICS_PQ;
+        }
+    }
+#endif
+
+    if (settings.paspPresent) {
+        image->transformFlags |= AVIF_TRANSFORM_PASP;
+        image->pasp.hSpacing = settings.paspValues[0];
+        image->pasp.vSpacing = settings.paspValues[1];
+    }
+    if (cropConversionRequired) {
+        if (!convertCropToClap(image->width, image->height, settings.clapValues)) {
+            goto cleanup;
+        }
+        settings.clapValid = AVIF_TRUE;
+    }
+    if (settings.clapValid) {
+        image->transformFlags |= AVIF_TRANSFORM_CLAP;
+        image->clap.widthN = settings.clapValues[0];
+        image->clap.widthD = settings.clapValues[1];
+        image->clap.heightN = settings.clapValues[2];
+        image->clap.heightD = settings.clapValues[3];
+        image->clap.horizOffN = settings.clapValues[4];
+        image->clap.horizOffD = settings.clapValues[5];
+        image->clap.vertOffN = settings.clapValues[6];
+        image->clap.vertOffD = settings.clapValues[7];
+
+        avifCropRect cropRect;
+        avifDiagnostics diag;
+        avifDiagnosticsClearError(&diag);
+        if (!avifCropRectFromCleanApertureBox(&cropRect, &image->clap, image->width, image->height, &diag)) {
+            fprintf(stderr,
+                    "ERROR: Invalid clap: width:[%d / %d], height:[%d / %d], horizOff:[%d / %d], vertOff:[%d / %d] - %s\n",
+                    (int32_t)image->clap.widthN,
+                    (int32_t)image->clap.widthD,
+                    (int32_t)image->clap.heightN,
+                    (int32_t)image->clap.heightD,
+                    (int32_t)image->clap.horizOffN,
+                    (int32_t)image->clap.horizOffD,
+                    (int32_t)image->clap.vertOffN,
+                    (int32_t)image->clap.vertOffD,
+                    diag.error);
+            goto cleanup;
+        }
+    }
+    if (irotAngle != 0xff) {
+        image->transformFlags |= AVIF_TRANSFORM_IROT;
+        image->irot.angle = irotAngle;
+    }
+    if (imirAxis != 0xff) {
+        image->transformFlags |= AVIF_TRANSFORM_IMIR;
+        image->imir.axis = imirAxis;
+    }
+    if (settings.clliPresent) {
+        image->clli.maxCLL = (uint16_t)settings.clliValues[0];
+        image->clli.maxPALL = (uint16_t)settings.clliValues[1];
+    }
+
+    avifBool hasAlpha = (image->alphaPlane && image->alphaRowBytes);
+    avifBool usingLosslessColor = (firstFile->settings.quality.value == AVIF_QUALITY_LOSSLESS);
+    avifBool usingLosslessAlpha = (firstFile->settings.qualityAlpha.value == AVIF_QUALITY_LOSSLESS);
+    avifBool using400 = (image->yuvFormat == AVIF_PIXEL_FORMAT_YUV400);
+    avifBool using444 = (image->yuvFormat == AVIF_PIXEL_FORMAT_YUV444);
+    avifBool usingFullRange = (image->yuvRange == AVIF_RANGE_FULL);
+    avifBool usingIdentityMatrix = (image->matrixCoefficients == AVIF_MATRIX_COEFFICIENTS_IDENTITY);
+
+    if (!lossless && usingLosslessColor && (!hasAlpha || usingLosslessAlpha)) {
+        printf("Quality set to %d, assuming --lossless to enable warnings on potential lossless issues.\n", AVIF_QUALITY_LOSSLESS);
+        lossless = AVIF_TRUE;
+    }
+
+    if (lossless) {
+        if (!usingLosslessColor) {
+            fprintf(stderr,
+                    "WARNING: [--lossless] Color quality (-q or --qcolor) not set to %d. Color output might not be lossless.\n",
+                    AVIF_QUALITY_LOSSLESS);
+            lossless = AVIF_FALSE;
+        }
+
+        if (hasAlpha && !usingLosslessAlpha) {
+            fprintf(stderr,
+                    "WARNING: [--lossless] Alpha present and alpha quality (--qalpha) not set to %d. Alpha output might not be lossless.\n",
+                    AVIF_QUALITY_LOSSLESS);
+            lossless = AVIF_FALSE;
+        }
+
+        if (usingIdentityMatrix && (sourceDepth != image->depth)) {
+            fprintf(stderr,
+                    "WARNING: [--lossless] Identity matrix is used but input depth (%d) does not match output depth (%d). Output might not be lossless.\n",
+                    sourceDepth,
+                    image->depth);
+            lossless = AVIF_FALSE;
+        }
+
+        if (sourceWasRGB) {
+            if (!using444 && !using400) {
+                fprintf(stderr,
+                        "WARNING: [--lossless] Input data was RGB and YUV "
+                        "subsampling (-y) isn't YUV444 or YUV400. Output might "
+                        "not be lossless.\n");
+                lossless = AVIF_FALSE;
+            }
+
+            if (!usingFullRange) {
+                fprintf(stderr, "WARNING: [--lossless] Input data was RGB and output range (-r) isn't full. Output might not be lossless.\n");
+                lossless = AVIF_FALSE;
+            }
+
+            avifBool matrixCoefficientsAreLosslessCompatible = usingIdentityMatrix ||
+                                                               image->matrixCoefficients == AVIF_MATRIX_COEFFICIENTS_YCGCO_RE ||
+                                                               image->matrixCoefficients == AVIF_MATRIX_COEFFICIENTS_YCGCO_RO;
+            if (!matrixCoefficientsAreLosslessCompatible && !using400) {
+                fprintf(stderr, "WARNING: [--lossless] Input data was RGB and matrixCoefficients isn't set to identity (--cicp x/x/0) or YCgCo-Re/Ro (--cicp x/x/16 or x/x/17); Output might not be lossless.\n");
+                lossless = AVIF_FALSE;
+            }
+        }
+    }
+
+    const char * lossyHint = " (Lossy)";
+    if (lossless) {
+        lossyHint = " (Lossless)";
+    }
+    printf("AVIF to be written:%s\n", lossyHint);
+    avifImageDump(image, 0, 0, settings.layers > 1 ? AVIF_PROGRESSIVE_STATE_AVAILABLE : AVIF_PROGRESSIVE_STATE_UNAVAILABLE);
+
+    avifEncodedByteSizes byteSizes = { 0, 0, 0 };
+    if (!avifEncodeImages(&settings, input, firstFile, image, NULL, &raw, &byteSizes)) {
+        goto cleanup;
+    }
+
+    printf("Encoded successfully.\n");
+    printf(" * Color total size: %" AVIF_FMT_ZU " bytes\n", byteSizes.colorSizeBytes);
+    printf(" * Alpha total size: %" AVIF_FMT_ZU " bytes\n", byteSizes.alphaSizeBytes);
+    if (byteSizes.gainMapSizeBytes > 0) {
+        printf(" * Gain Map AV1 total size: %" AVIF_FMT_ZU " bytes\n", byteSizes.gainMapSizeBytes);
+    }
+
+    if (noOverwrite && fileExists(outputFilename)) {
+        fprintf(stderr, "ERROR: output file %s already exists and --no-overwrite was specified\n", outputFilename);
+        goto cleanup;
+    }
+    if (!avifEnsureParentDirectory(outputFilename)) {
+        goto cleanup;
+    }
+
+    FILE * f = fopen(outputFilename, "wb");
+    if (!f) {
+        fprintf(stderr, "ERROR: Failed to open file for write: %s\n", outputFilename);
+        goto cleanup;
+    }
+    if (fwrite(raw.data, 1, raw.size, f) != raw.size) {
+        fprintf(stderr, "Failed to write %" AVIF_FMT_ZU " bytes: %s\n", raw.size, outputFilename);
+        fclose(f);
+        goto cleanup;
+    }
+    fclose(f);
+
+    printf("Wrote AVIF: %s\n", outputFilename);
+    success = AVIF_TRUE;
+
+cleanup:
+    if (image) {
+        avifImageDestroy(image);
+    }
+    avifRWDataFree(&raw);
+    return success;
+}
+
+typedef struct avifBatchStats
+{
+    int discovered;
+    int converted;
+    int skipped;
+    int failed;
+} avifBatchStats;
+
+typedef struct avifBatchContext
+{
+    const char * outputRoot;
+    avifSettings settingsTemplate;
+    const avifInputFileSettings * fileSettingsTemplate;
+    avifPixelFormat requestedFormat;
+    int requestedDepth;
+    int requestedDepthExtension;
+    avifBool noOverwrite;
+    avifRange requestedRange;
+    avifBool lossless;
+    avifBool premultiplyAlpha;
+    avifBool cropConversionRequired;
+    uint8_t irotAngle;
+    uint8_t imirAxis;
+    const avifRWData * exifOverride;
+    const avifRWData * xmpOverride;
+    const avifRWData * iccOverride;
+    avifBatchStats stats;
+} avifBatchContext;
+
+static avifBool avifBatchEncodeOneFile(avifBatchContext * context, const char * inputPath, const char * relativePath)
+{
+    ++context->stats.discovered;
+
+    const avifAppFileFormat guessedFormat = avifGuessFileFormat(inputPath);
+    if (!avifIsSupportedBatchInputFormat(guessedFormat)) {
+        ++context->stats.skipped;
+        printf("Skipping unsupported file: %s\n", inputPath);
+        return AVIF_TRUE;
+    }
+    if ((context->settingsTemplate.inputFormat != AVIF_APP_FILE_FORMAT_UNKNOWN) && (guessedFormat != context->settingsTemplate.inputFormat)) {
+        ++context->stats.skipped;
+        printf("Skipping format-mismatched file: %s (detected %s)\n", inputPath, avifFileFormatToString(guessedFormat));
+        return AVIF_TRUE;
+    }
+
+    char * outputRelative = avifReplaceExtensionWithAvif(relativePath);
+    if (outputRelative == NULL) {
+        fprintf(stderr, "ERROR: Out of memory while computing output filename for %s\n", inputPath);
+        ++context->stats.failed;
+        return AVIF_FALSE;
+    }
+    char * outputPath = avifPathJoin(context->outputRoot, outputRelative);
+    free(outputRelative);
+    if (outputPath == NULL) {
+        fprintf(stderr, "ERROR: Out of memory while computing output path for %s\n", inputPath);
+        ++context->stats.failed;
+        return AVIF_FALSE;
+    }
+
+    avifInput singleInput;
+    if (!avifInputInitSingleFile(&singleInput,
+                                 inputPath,
+                                 context->settingsTemplate.outputTiming.duration,
+                                 context->fileSettingsTemplate,
+                                 context->requestedFormat,
+                                 context->requestedDepth,
+                                 context->requestedDepthExtension)) {
+        free(outputPath);
+        ++context->stats.failed;
+        return AVIF_FALSE;
+    }
+
+    const avifBool encoded = avifEncodeSingleInputToFile(context->settingsTemplate,
+                                                         &singleInput,
+                                                         outputPath,
+                                                         context->noOverwrite,
+                                                         context->requestedRange,
+                                                         context->lossless,
+                                                         context->premultiplyAlpha,
+                                                         context->cropConversionRequired,
+                                                         context->irotAngle,
+                                                         context->imirAxis,
+                                                         context->exifOverride,
+                                                         context->xmpOverride,
+                                                         context->iccOverride);
+    avifInputCleanup(&singleInput);
+    free(outputPath);
+
+    if (encoded) {
+        ++context->stats.converted;
+    } else {
+        ++context->stats.failed;
+    }
+    return AVIF_TRUE;
+}
+
+static avifBool avifBatchProcessDirectoryRecursive(avifBatchContext * context, const char * currentPath, const char * relativePath)
+{
+    avifBool success = AVIF_TRUE;
+
+#if defined(_WIN32)
+    char * searchPattern = avifPathJoin(currentPath, "*");
+    if (searchPattern == NULL) {
+        fprintf(stderr, "ERROR: Out of memory while enumerating directory: %s\n", currentPath);
+        return AVIF_FALSE;
+    }
+
+    WIN32_FIND_DATAA findData;
+    HANDLE findHandle = FindFirstFileA(searchPattern, &findData);
+    free(searchPattern);
+    if (findHandle == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "ERROR: Failed to enumerate directory: %s\n", currentPath);
+        return AVIF_FALSE;
+    }
+
+    do {
+        const char * entryName = findData.cFileName;
+        if (!strcmp(entryName, ".") || !strcmp(entryName, "..")) {
+            continue;
+        }
+
+        char * childPath = avifPathJoin(currentPath, entryName);
+        if (childPath == NULL) {
+            fprintf(stderr, "ERROR: Out of memory while joining directory path: %s\n", currentPath);
+            success = AVIF_FALSE;
+            continue;
+        }
+        char * childRelative = (relativePath[0] == '\0') ? avifStringDuplicate(entryName) : avifPathJoin(relativePath, entryName);
+        if (childRelative == NULL) {
+            fprintf(stderr, "ERROR: Out of memory while joining relative path: %s\n", entryName);
+            free(childPath);
+            success = AVIF_FALSE;
+            continue;
+        }
+
+        if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            if (!avifBatchProcessDirectoryRecursive(context, childPath, childRelative)) {
+                success = AVIF_FALSE;
+            }
+        } else if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DEVICE) == 0) {
+            if (!avifBatchEncodeOneFile(context, childPath, childRelative)) {
+                success = AVIF_FALSE;
+            }
+        }
+
+        free(childRelative);
+        free(childPath);
+    } while (FindNextFileA(findHandle, &findData) != 0);
+
+    const DWORD lastError = GetLastError();
+    FindClose(findHandle);
+    if (lastError != ERROR_NO_MORE_FILES) {
+        fprintf(stderr, "ERROR: Failed while enumerating directory: %s\n", currentPath);
+        success = AVIF_FALSE;
+    }
+#else
+    DIR * dir = opendir(currentPath);
+    if (dir == NULL) {
+        fprintf(stderr, "ERROR: Failed to open directory: %s\n", currentPath);
+        return AVIF_FALSE;
+    }
+
+    struct dirent * entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        const char * entryName = entry->d_name;
+        if (!strcmp(entryName, ".") || !strcmp(entryName, "..")) {
+            continue;
+        }
+
+        char * childPath = avifPathJoin(currentPath, entryName);
+        if (childPath == NULL) {
+            fprintf(stderr, "ERROR: Out of memory while joining directory path: %s\n", currentPath);
+            success = AVIF_FALSE;
+            continue;
+        }
+        char * childRelative = (relativePath[0] == '\0') ? avifStringDuplicate(entryName) : avifPathJoin(relativePath, entryName);
+        if (childRelative == NULL) {
+            fprintf(stderr, "ERROR: Out of memory while joining relative path: %s\n", entryName);
+            free(childPath);
+            success = AVIF_FALSE;
+            continue;
+        }
+
+        struct stat info;
+        if (stat(childPath, &info) != 0) {
+            fprintf(stderr, "ERROR: Failed to stat path: %s\n", childPath);
+            free(childRelative);
+            free(childPath);
+            success = AVIF_FALSE;
+            continue;
+        }
+
+        if (S_ISDIR(info.st_mode)) {
+            if (!avifBatchProcessDirectoryRecursive(context, childPath, childRelative)) {
+                success = AVIF_FALSE;
+            }
+        } else if (S_ISREG(info.st_mode)) {
+            if (!avifBatchEncodeOneFile(context, childPath, childRelative)) {
+                success = AVIF_FALSE;
+            }
+        }
+
+        free(childRelative);
+        free(childPath);
+    }
+
+    closedir(dir);
+#endif
+
+    return success;
+}
+
+static int avifEncodeDirectoryBatch(const char * inputDirectory,
+                                    const char * outputDirectory,
+                                    const avifSettings * settingsTemplate,
+                                    const avifInputFileSettings * fileSettingsTemplate,
+                                    avifPixelFormat requestedFormat,
+                                    int requestedDepth,
+                                    int requestedDepthExtension,
+                                    avifBool noOverwrite,
+                                    avifRange requestedRange,
+                                    avifBool lossless,
+                                    avifBool premultiplyAlpha,
+                                    avifBool cropConversionRequired,
+                                    uint8_t irotAngle,
+                                    uint8_t imirAxis,
+                                    const avifRWData * exifOverride,
+                                    const avifRWData * xmpOverride,
+                                    const avifRWData * iccOverride)
+{
+    if (!avifPathIsDirectory(inputDirectory)) {
+        fprintf(stderr, "ERROR: Input path is not a directory: %s\n", inputDirectory);
+        return 1;
+    }
+    if (avifPathIsRegularFile(outputDirectory)) {
+        fprintf(stderr, "ERROR: Output path points to a regular file, expected a directory: %s\n", outputDirectory);
+        return 1;
+    }
+
+    if ((settingsTemplate->inputFormat != AVIF_APP_FILE_FORMAT_UNKNOWN) &&
+        !avifIsSupportedBatchInputFormat(settingsTemplate->inputFormat)) {
+        fprintf(stderr, "ERROR: Unsupported --input-format for directory mode: %s\n", avifFileFormatToString(settingsTemplate->inputFormat));
+        return 1;
+    }
+    if (settingsTemplate->layered || settingsTemplate->gridDimsPresent) {
+        fprintf(stderr, "ERROR: Directory mode does not support --layered or --grid.\n");
+        return 1;
+    }
+    if (!avifEnsureDirectoryExists(outputDirectory)) {
+        return 1;
+    }
+
+    avifBatchContext context;
+    memset(&context, 0, sizeof(context));
+    context.outputRoot = outputDirectory;
+    context.settingsTemplate = *settingsTemplate;
+    context.fileSettingsTemplate = fileSettingsTemplate;
+    context.requestedFormat = requestedFormat;
+    context.requestedDepth = requestedDepth;
+    context.requestedDepthExtension = requestedDepthExtension;
+    context.noOverwrite = noOverwrite;
+    context.requestedRange = requestedRange;
+    context.lossless = lossless;
+    context.premultiplyAlpha = premultiplyAlpha;
+    context.cropConversionRequired = cropConversionRequired;
+    context.irotAngle = irotAngle;
+    context.imirAxis = imirAxis;
+    context.exifOverride = exifOverride;
+    context.xmpOverride = xmpOverride;
+    context.iccOverride = iccOverride;
+
+    printf("Batch mode: recursively encoding images from %s to %s\n", inputDirectory, outputDirectory);
+    const avifBool walkOk = avifBatchProcessDirectoryRecursive(&context, inputDirectory, "");
+
+    printf("Batch summary: converted %d, skipped %d, failed %d, discovered %d\n",
+           context.stats.converted,
+           context.stats.skipped,
+           context.stats.failed,
+           context.stats.discovered);
+
+    if (context.stats.discovered == 0) {
+        fprintf(stderr, "ERROR: No files found in input directory: %s\n", inputDirectory);
+        return 1;
+    }
+    if (context.stats.converted == 0) {
+        fprintf(stderr, "ERROR: No files were encoded successfully.\n");
+        return 1;
+    }
+    if (!walkOk || (context.stats.failed > 0)) {
+        return 1;
+    }
+    return 0;
 }
 
 int main(int argc, char * argv[])
@@ -2084,6 +3152,32 @@ int main(int argc, char * argv[])
         goto cleanup;
     }
 
+    const avifBool batchMode = (input.filesCount == 1) && (input.files[0].filename != AVIF_FILENAME_STDIN) &&
+                               avifPathIsDirectory(input.files[0].filename);
+    if (batchMode) {
+        if (memcmp(&pendingSettings, &emptySettingsReference, sizeof(avifInputFileSettings)) != 0) {
+            fprintf(stderr, "WARNING: Trailing options with update suffix has no effect. Place them before the input you intend to apply to.\n");
+        }
+        returnCode = avifEncodeDirectoryBatch(input.files[0].filename,
+                                              outputFilename,
+                                              &settings,
+                                              &input.files[0].settings,
+                                              input.requestedFormat,
+                                              input.requestedDepth,
+                                              input.requestedDepthExtension,
+                                              noOverwrite,
+                                              requestedRange,
+                                              lossless,
+                                              premultiplyAlpha,
+                                              cropConversionRequired,
+                                              irotAngle,
+                                              imirAxis,
+                                              &exifOverride,
+                                              &xmpOverride,
+                                              &iccOverride);
+        goto cleanup;
+    }
+
     if (noOverwrite && fileExists(outputFilename)) {
         fprintf(stderr, "ERROR: output file %s already exists and --no-overwrite was specified\n", outputFilename);
         goto cleanup;
@@ -2659,19 +3753,7 @@ cleanup:
     avifRWDataFree(&xmpOverride);
     avifRWDataFree(&iccOverride);
     avifCodecSpecificOptionsFree(&pendingSettings.codecSpecificOptions);
-    while (input.cacheCount) {
-        --input.cacheCount;
-        if (input.cache[input.cacheCount].image) {
-            avifImageDestroy(input.cache[input.cacheCount].image);
-        }
-    }
-    free(input.cache);
-    while (input.filesCount) {
-        --input.filesCount;
-        avifInputFile * file = &input.files[input.filesCount];
-        avifCodecSpecificOptionsFree(&file->settings.codecSpecificOptions);
-    }
-    free(input.files);
+    avifInputCleanup(&input);
 
     return returnCode;
 }
